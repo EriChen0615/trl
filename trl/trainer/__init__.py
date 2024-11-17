@@ -30,6 +30,8 @@ _import_structure = {
     "ddpo_config": ["DDPOConfig"],
     "dpo_config": ["DPOConfig", "FDivergenceConstants", "FDivergenceType"],
     "dpo_trainer": ["DPOTrainer"],
+    "dporkd_trainer": ["DPORKDTrainer"],
+    "dporkd_config": ["DPORKDConfig"],
     "gkd_config": ["GKDConfig"],
     "gkd_trainer": ["GKDTrainer"],
     "iterative_sft_trainer": ["IterativeSFTTrainer"],
@@ -94,6 +96,8 @@ if TYPE_CHECKING:
     from .ddpo_config import DDPOConfig
     from .dpo_config import DPOConfig, FDivergenceConstants, FDivergenceType
     from .dpo_trainer import DPOTrainer
+    from .dporkd_config import DPORKDConfig
+    from .dporkd_trainer import DPORKDTrainer
     from .gkd_config import GKDConfig
     from .gkd_trainer import GKDTrainer
     from .iterative_sft_trainer import IterativeSFTTrainer
