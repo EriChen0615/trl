@@ -124,8 +124,8 @@ class PreferenceCollator(DataCollatorMixin):
         chosen_attention_mask = [torch.ones_like(input_ids) for input_ids in chosen_input_ids]
         rejected_input_ids = [torch.tensor(example["rejected_input_ids"]) for example in examples]
         rejected_attention_mask = [torch.ones_like(input_ids) for input_ids in rejected_input_ids]
-        breakpoint()
-        is_ties = [torch.tensor(example['is_ties']) for example in examples] #NOTE JC
+        # breakpoint() #NOTE JC
+        is_ties = [example['is_tie'] for example in examples] #NOTE JC
         if "pixel_values" in examples[0]:
             pixel_values = [torch.tensor(example["pixel_values"]) for example in examples]
         if "pixel_attention_mask" in examples[0]:
@@ -144,7 +144,7 @@ class PreferenceCollator(DataCollatorMixin):
         if "pixel_attention_mask" in examples[0]:
             output["pixel_attention_mask"] = pad(pixel_attention_mask, padding_value=0)
         
-        output['is_ties'] = is_ties
+        output['is_ties'] = torch.BoolTensor(is_ties)
         return output
 
 
@@ -570,17 +570,17 @@ class DPORKDTrainer(Trainer):
             args.beta = beta
         self.beta = args.beta
 
-        if args.rkd_alpha != None:
+        if rkd_alpha != None:
             warnings.warn(
                 "You passed `beta` to the DPORKDTrainer, the value you passed will override the one in the `DPOConfig`."
             )
             args.rkd_alpha = rkd_alpha
         else:
-            if loss_type == 'rao-kupper': args.rkd_alpha = 1.0968
-            elif loss_type == 'davidson': args.rkd_alpha = 0.0
+            if args.loss_type == 'rao-kupper': args.rkd_alpha = 1.0968
+            elif args.loss_type == 'davidson': args.rkd_alpha = 0.0
         self.rkd_alpha = args.rkd_alpha
 
-        breakpoint() #NOTE check RKD alpha
+        # breakpoint() #NOTE check RKD alpha
 
         self.label_smoothing = args.label_smoothing
         self.loss_type = args.loss_type
@@ -762,7 +762,7 @@ class DPORKDTrainer(Trainer):
             chosen_input_ids = chosen_input_ids[:max_completion_length]
             rejected_input_ids = rejected_input_ids[:max_completion_length]
 
-        breakpoint()
+        # breakpoint() #NOTE JC
         return {
             "prompt_input_ids": prompt_input_ids,
             "chosen_input_ids": chosen_input_ids,
@@ -849,7 +849,7 @@ class DPORKDTrainer(Trainer):
         # In DPORKDTrainer, we preprocess data, so using the model's signature columns doesn't work.
         # Instead, we set them to the columns expected by `DPODataCollatorWithPadding`, hence the override.
         if self._signature_columns is None:
-            self._signature_columns = ["prompt_input_ids", "chosen_input_ids", "rejected_input_ids"]
+            self._signature_columns = ["prompt_input_ids", "chosen_input_ids", "rejected_input_ids", "is_tie"]
 
     def get_train_dataloader(self) -> DataLoader:
         """
@@ -894,6 +894,7 @@ class DPORKDTrainer(Trainer):
 
             self._precomputed_train_ref_log_probs = True
 
+        # breakpoint() #NOTE JC check is_ties. CHECKED
         return super().get_train_dataloader()
 
     def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
@@ -1203,15 +1204,18 @@ class DPORKDTrainer(Trainer):
             losses = losses_chosen + losses_rejected
 
         elif self.loss_type == "rao-kupper":
-            breakpoint()
-            pass
-            #TODO
+            d_x_yw_yl = self.beta * logits
+            cp_losses = (~is_ties) * -F.logsigmoid(d_x_yw_yl - self.rkd_alpha)
+            tie_losses = (is_ties) * -(F.logsigmoid(-d_x_yw_yl - self.rkd_alpha) + F.logsigmoid(d_x_yw_yl - self.rkd_alpha))  
+            losses = cp_losses + tie_losses
+            # breakpoint() #NOTE JC
         
         elif self.loss_type == 'davidson':
-            breakpoint()
-            pass
-            #TODO
-
+            d_x_yw_yl = self.beta * logits
+            cp_losses = (~is_ties) * torch.log((1 + torch.exp(-d_x_yw_yl) + 2*torch.exp(-0.5*d_x_yw_yl + self.rkd_alpha))) 
+            tie_losses = (is_ties) * torch.log(1 + 0.5*torch.exp(0.5*d_x_yw_yl-self.rkd_alpha) + 0.5*torch.exp(-0.5*d_x_yw_yl-self.rkd_alpha))  
+            losses = cp_losses + tie_losses
+            # breakpoint() #NOTE JC
         else:
             raise ValueError(
                 f"Unknown loss type: {self.loss_type}. Should be one of ['sigmoid', 'hinge', 'ipo', 'exo_pair', "
@@ -1349,8 +1353,8 @@ class DPORKDTrainer(Trainer):
         batch: Dict[str, Union[List, torch.LongTensor]],
         train_eval: Literal["train", "eval"] = "train",
     ):
-        breakpoint()
         is_ties = batch['is_ties'] #NOTE JC must have
+        # breakpoint()
         
         """Compute the DPO loss and other metrics for the given batch of inputs for train or test."""
         metrics = {}
@@ -1391,7 +1395,16 @@ class DPORKDTrainer(Trainer):
             metrics[f"{prefix}nll_loss"] = model_output["nll_loss"].detach().mean().cpu()
         if self.aux_loss_enabled:
             metrics[f"{prefix}aux_loss"] = model_output["aux_loss"].detach().cpu()
+        if self.loss_type in ['rao-kupper', 'davidson']:
+            metrics[f"is_ties%"] = batch['is_ties'].to(torch.float).mean().cpu()
+            metrics[f"{prefix}rewards/tp_chosen"] = (batch['is_ties']*chosen_rewards).mean().cpu()
+            metrics[f"{prefix}rewards/tp_rejected"] = (batch['is_ties']*rejected_rewards).mean().cpu()
+            metrics[f"{prefix}rewards/tp_margins"] = metrics[f"{prefix}rewards/tp_chosen"] - metrics[f"{prefix}rewards/tp_rejected"]
 
+            metrics[f"{prefix}rewards/cp_chosen"] = ((~batch['is_ties'])*chosen_rewards).mean().cpu()
+            metrics[f"{prefix}rewards/cp_rejected"] = ((~batch['is_ties'])*rejected_rewards).mean().cpu()
+            metrics[f"{prefix}rewards/cp_margins"] = metrics[f"{prefix}rewards/cp_chosen"] - metrics[f"{prefix}rewards/cp_rejected"]
+        # breakpoint() #NOTE JC check metrics
         return losses.mean(), metrics
 
     def compute_loss(
