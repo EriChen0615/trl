@@ -572,7 +572,7 @@ class DPORKDTrainer(Trainer):
 
         if rkd_alpha != None:
             warnings.warn(
-                "You passed `beta` to the DPORKDTrainer, the value you passed will override the one in the `DPOConfig`."
+                "You passed `beta` to the DPORKDTrainer, the value you passed will override the one in the `DPORKDConfig`."
             )
             args.rkd_alpha = rkd_alpha
         else:
