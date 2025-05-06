@@ -1212,8 +1212,29 @@ class DPORKDTrainer(Trainer):
         
         elif self.loss_type == 'davidson':
             d_x_yw_yl = self.beta * logits
-            cp_losses = (~is_ties) * torch.log((1 + torch.exp(-d_x_yw_yl) + 2*torch.exp(-0.5*d_x_yw_yl + self.rkd_alpha))) 
-            tie_losses = (is_ties) * torch.log(1 + 0.5*torch.exp(0.5*d_x_yw_yl-self.rkd_alpha) + 0.5*torch.exp(-0.5*d_x_yw_yl-self.rkd_alpha))  
+            #NOTE the code below has numerical issues.
+            # cp_losses = (~is_ties) * torch.log((1 + torch.exp(-d_x_yw_yl) + 2*torch.exp(-0.5*d_x_yw_yl + self.rkd_alpha))) 
+            # tie_losses = (is_ties) * torch.log(1 + 0.5*torch.exp(0.5*d_x_yw_yl-self.rkd_alpha) + 0.5*torch.exp(-0.5*d_x_yw_yl-self.rkd_alpha))  
+            # For clear preference pairs (not ties)
+            # Original: log(1 + exp(-d) + 2*exp(-0.5*d + alpha))
+            # Rewrite using logsumexp for stability
+            cp_terms = torch.stack([
+                torch.zeros_like(d_x_yw_yl),  # log(1)
+                -d_x_yw_yl,                   # log(exp(-d))
+                torch.log(torch.tensor(2.0, device=d_x_yw_yl.device)) + (-0.5*d_x_yw_yl + self.rkd_alpha)  # log(2*exp(-0.5*d + alpha))
+            ], dim=0)
+            cp_losses = (~is_ties) * torch.logsumexp(cp_terms, dim=0)
+            
+            # For tie pairs
+            # Original: log(1 + 0.5*exp(0.5*d-alpha) + 0.5*exp(-0.5*d-alpha))
+            # Rewrite using logsumexp for stability
+            tie_terms = torch.stack([
+                torch.zeros_like(d_x_yw_yl),  # log(1)
+                torch.log(torch.tensor(0.5, device=d_x_yw_yl.device)) + (0.5*d_x_yw_yl-self.rkd_alpha),  # log(0.5*exp(0.5*d-alpha))
+                torch.log(torch.tensor(0.5, device=d_x_yw_yl.device)) + (-0.5*d_x_yw_yl-self.rkd_alpha)  # log(0.5*exp(-0.5*d-alpha))
+            ], dim=0)
+            tie_losses = (is_ties) * torch.logsumexp(tie_terms, dim=0)
+            
             losses = cp_losses + tie_losses
             # breakpoint() #NOTE JC
         else:
