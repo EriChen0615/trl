@@ -254,6 +254,7 @@ class DPORKDTrainer(Trainer):
         reference_free: bool = False,
         force_use_ref_model: bool = False,
         rkd_alpha: Optional[float] = None,
+        rkd_alpha_scheduling: Optional[str] = None,
     ):
         if not isinstance(model, str) and ref_model is model:
             raise ValueError(
@@ -580,7 +581,15 @@ class DPORKDTrainer(Trainer):
             elif args.loss_type == 'davidson': args.rkd_alpha = 0.0
         self.rkd_alpha = args.rkd_alpha
 
-        # breakpoint() #NOTE check RKD alpha
+        if rkd_alpha_scheduling is not None:
+            warnings.warn(
+                "You passed `rkd_alpha_scheduling` to the DPORKDTrainer, the value you passed will override the one in the `DPORKDConfig`."
+            )
+            args.rkd_alpha_scheduling = rkd_alpha_scheduling
+        self.rkd_alpha_scheduling = args.rkd_alpha_scheduling
+
+        if self.rkd_alpha_scheduling is not None:
+            print(f"Using {self.rkd_alpha_scheduling} scheduling for RKD alpha")
 
         self.label_smoothing = args.label_smoothing
         self.loss_type = args.loss_type
@@ -1067,6 +1076,7 @@ class DPORKDTrainer(Trainer):
             The `chosen_rewards` and `rejected_rewards` tensors contain the rewards for the chosen and rejected
             responses, respectively.
         """
+        log_info = {}
         device = self.accelerator.device
 
         # Get the log ratios for the chosen and rejected responses
@@ -1205,8 +1215,54 @@ class DPORKDTrainer(Trainer):
 
         elif self.loss_type == "rao-kupper":
             d_x_yw_yl = self.beta * logits
-            cp_losses = (~is_ties) * -F.logsigmoid(d_x_yw_yl - self.rkd_alpha)
-            tie_losses = (is_ties) * -(F.logsigmoid(-d_x_yw_yl - self.rkd_alpha) + F.logsigmoid(d_x_yw_yl - self.rkd_alpha))  
+            if self.rkd_alpha_scheduling is None or self.rkd_alpha_scheduling == 'none':
+                cp_losses = (~is_ties) * -F.logsigmoid(d_x_yw_yl - self.rkd_alpha)
+                tie_losses = (is_ties) * -(F.logsigmoid(-d_x_yw_yl - self.rkd_alpha) + F.logsigmoid(d_x_yw_yl - self.rkd_alpha))  
+            else:
+                if self.rkd_alpha_scheduling == 'ref_llk_cancel':
+                    policy_logratios = ref_chosen_logps - ref_rejected_logps
+                    dyn_rkd_alpha = torch.where(policy_logratios < 0, -policy_logratios, torch.zeros_like(policy_logratios))
+                    # For clear preference data: dyn_rkd_alpha =policy_logratio if policy_logratio<0, else 0
+                    # For tie preference data: dyn_rkd_alpha = |policy_logratio|
+                    dyn_rkd_alpha = torch.where(
+                        is_ties,
+                        torch.abs(policy_logratios),  # For ties
+                        torch.where(policy_logratios < 0, -policy_logratios, torch.zeros_like(policy_logratios, device=policy_logratios.device))  # For clear preferences
+                    )
+                    dyn_rkd_alpha *= self.beta 
+
+                    cp_losses = (~is_ties) * -F.logsigmoid(d_x_yw_yl - dyn_rkd_alpha)
+                    tie_losses = (is_ties) * -(F.logsigmoid(-d_x_yw_yl - dyn_rkd_alpha) + F.logsigmoid(d_x_yw_yl - dyn_rkd_alpha))  
+                    # else:
+                        # cp_losses = (~is_ties) * -F.logsigmoid(d_x_yw_yl)
+                    # tie_losses = (is_ties) * -(F.logsigmoid(-d_x_yw_yl - self.rkd_alpha) + F.logsigmoid(d_x_yw_yl - self.rkd_alpha))  
+                    log_info['dyn_rkd_alpha'] = dyn_rkd_alpha.detach().cpu().numpy()
+                elif self.rkd_alpha_scheduling in ['ref_llk_cancel_cp_only_thresh_inverse_beta', 'ref_llk_cancel_cp_only_thresh_zero']:
+                    policy_logratios = ref_chosen_logps - ref_rejected_logps
+                    dyn_rkd_alpha = torch.where(policy_logratios < 0, -policy_logratios, torch.zeros_like(policy_logratios))
+                    # For clear preference data: dyn_rkd_alpha =policy_logratio if policy_logratio<0, else 0
+                    # For tie preference data: dyn_rkd_alpha = |policy_logratio|
+                    if self.rkd_alpha_scheduling == 'ref_llk_cancel_cp_only_thresh_inverse_beta':
+                        thresh = -1/self.beta
+                    elif self.rkd_alpha_scheduling == 'ref_llk_cancel_cp_only_thresh_zero':
+                        thresh = 0
+
+                    dyn_rkd_alpha = torch.where(
+                        is_ties,
+                        self.rkd_alpha,  # For ties
+                        torch.where(policy_logratios < thresh, -policy_logratios, torch.zeros_like(policy_logratios, device=policy_logratios.device))  # For clear preferences
+                    )
+
+                    dyn_rkd_alpha *= self.beta 
+
+                    cp_losses = (~is_ties) * -F.logsigmoid(d_x_yw_yl - dyn_rkd_alpha)
+                    tie_losses = (is_ties) * -(F.logsigmoid(-d_x_yw_yl - dyn_rkd_alpha) + F.logsigmoid(d_x_yw_yl - dyn_rkd_alpha))  
+                    # else:
+                        # cp_losses = (~is_ties) * -F.logsigmoid(d_x_yw_yl)
+                    # tie_losses = (is_ties) * -(F.logsigmoid(-d_x_yw_yl - self.rkd_alpha) + F.logsigmoid(d_x_yw_yl - self.rkd_alpha))  
+                    log_info['dyn_rkd_alpha'] = dyn_rkd_alpha.detach().cpu().numpy()
+                else:
+                    raise NotImplementedError(f"RKD alpha scheduling {self.rkd_alpha_scheduling} not implemented")
             losses = cp_losses + tie_losses
             # breakpoint() #NOTE JC
         
@@ -1246,7 +1302,7 @@ class DPORKDTrainer(Trainer):
         chosen_rewards = self.beta * (chosen_logps.to(device) - ref_chosen_logps.to(device)).detach()
         rejected_rewards = self.beta * (rejected_logps.to(device) - ref_rejected_logps.to(device)).detach()
 
-        return losses, chosen_rewards, rejected_rewards
+        return losses, chosen_rewards, rejected_rewards, log_info
 
     def concatenated_forward(self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]]):
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
@@ -1389,10 +1445,10 @@ class DPORKDTrainer(Trainer):
         else:
             ref_chosen_logps, ref_rejected_logps = self.compute_ref_log_probs(batch)
 
-        losses, chosen_rewards, rejected_rewards = self.dpo_loss(
+        losses, chosen_rewards, rejected_rewards, log_info = self.dpo_loss(
             model_output["chosen_logps"], model_output["rejected_logps"], ref_chosen_logps, ref_rejected_logps, is_ties
         )
-        reward_accuracies = (chosen_rewards > rejected_rewards).float()
+        reward_accuracies = (~is_ties) * (chosen_rewards > rejected_rewards).float() # only compute reward acc on CPs
 
         if self.args.rpo_alpha is not None:
             losses = losses + self.args.rpo_alpha * model_output["nll_loss"]  # RPO loss from V3 of the paper
@@ -1406,7 +1462,7 @@ class DPORKDTrainer(Trainer):
         prefix = "eval_" if train_eval == "eval" else ""
         metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean().cpu()
         metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean().cpu()
-        metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean().cpu()
+        metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.sum().cpu() / ((~is_ties).sum().cpu() + 1e-6)
         metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean().cpu()
         metrics[f"{prefix}logps/chosen"] = model_output["chosen_logps"].detach().mean().cpu()
         metrics[f"{prefix}logps/rejected"] = model_output["rejected_logps"].detach().mean().cpu()
@@ -1425,6 +1481,9 @@ class DPORKDTrainer(Trainer):
             metrics[f"{prefix}rewards/cp_chosen"] = ((~batch['is_ties'])*chosen_rewards).mean().cpu()
             metrics[f"{prefix}rewards/cp_rejected"] = ((~batch['is_ties'])*rejected_rewards).mean().cpu()
             metrics[f"{prefix}rewards/cp_margins"] = metrics[f"{prefix}rewards/cp_chosen"] - metrics[f"{prefix}rewards/cp_rejected"]
+
+            if self.rkd_alpha_scheduling is not None:
+                metrics[f"{prefix}dyn_rkd_alpha"] = log_info['dyn_rkd_alpha'].mean()
         # breakpoint() #NOTE JC check metrics
         return losses.mean(), metrics
 

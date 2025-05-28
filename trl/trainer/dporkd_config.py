@@ -140,6 +140,8 @@ class DPORKDConfig(TrainingArguments):
         rkd_alpha (`float`, *optional*, defaults to `None`):
             α parameter from the [DPO-RK/D](https://arxiv.org/abs/2409.17431) paper. 
             When set to `None` (default), the trainer uses the recommended alpha value in the paper (ln3 for Rao-Kupper loss and 0 for Davidson loss)
+        rkd_alpha_scheduling (`str`, *optional*, defaults to `None`):
+            Type of alpha scheduling to use. E.g., based on ref_llk_cancel, ref_token_llk_cancel, etc.
     """
 
     learning_rate: float = 1e-6
@@ -188,6 +190,7 @@ class DPORKDConfig(TrainingArguments):
     rpo_alpha: Optional[float] = None
     use_num_logits_to_keep: bool = False
     rkd_alpha: Optional[float] = None
+    rkd_alpha_scheduling: Optional[str] = None
 
     def __post_init__(self):
         if self.max_target_length is not None:
